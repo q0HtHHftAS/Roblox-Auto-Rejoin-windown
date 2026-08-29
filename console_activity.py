@@ -1,0 +1,549 @@
+from __future__ import annotations
+
+import os
+import re
+import sys
+import threading
+import time
+from typing import Optional, Any, Dict
+from desktop import console_output
+
+_LOCK = threading.Lock()
+_ACTIVE_ACCOUNTS: set[str] = set()
+_CAPTCHA_ACCOUNTS: set[str] = set()
+_TOTAL_ACCOUNTS = 0
+_QUEUE_SIZE = 0
+_LAST_DISCONNECT_AT: Dict[str, float] = {}
+_LAST_CAPTCHA_AT: Dict[str, float] = {}
+_SUSPECT_LOGGED_ACCOUNTS: set[str] = set()
+_SUSPECT_FINALIZED_AT_BY_ACCOUNT: Dict[str, float] = {}
+_LAST_PID_BY_ACCOUNT: Dict[str, str] = {}
+_SERVER_TYPE_BY_ACCOUNT: Dict[str, str] = {}
+_LAST_FOUND_AT_BY_KEY: Dict[str, float] = {}
+_LAST_TELEPORT_AT_BY_ACCOUNT: Dict[str, float] = {}
+_LUA_LIVENESS_REQUIRED = False
+_DISCONNECT_DEDUP_SECONDS = 3.0
+_CAPTCHA_DEDUP_SECONDS = 3.0
+_FOUND_DEDUP_SECONDS = 3.0
+_TELEPORT_DEDUP_SECONDS = 3.0
+_SUSPECT_FINAL_SUPPRESS_SECONDS = 5.0
+
+_ICON_OK = "✔"
+_ICON_WARN = "⚠️"
+_ICON_FAIL = "❌"
+_ICON_VIP = "🔐"
+_ICON_VIP_SERVER = "👑"
+_ICON_PUBLIC_SERVER = "🦺"
+_ICON_CHECKING = "🚧"
+_ICON_TELEPORT = "🌀"
+_ICON_ALIASES = {
+    "OK": _ICON_OK,
+    "CHECK": _ICON_OK,
+    "SUCCESS": _ICON_OK,
+    "READY": _ICON_OK,
+    "!!": _ICON_WARN,
+    "WARN": _ICON_WARN,
+    "WARNING": _ICON_WARN,
+    "XX": _ICON_FAIL,
+    "FAIL": _ICON_FAIL,
+    "FAILED": _ICON_FAIL,
+    "ERROR": _ICON_FAIL,
+    "SERVER": _ICON_VIP,
+    "SMART": _ICON_VIP,
+    "VIP": _ICON_VIP,
+    "LOCK": _ICON_VIP,
+    "PRIVATE": _ICON_VIP,
+}
+
+_COLOR_DIM = "\x1b[90m"
+_COLOR_WHITE = "\x1b[97m"
+_COLOR_GOLD = "\x1b[38;2;255;215;0m"
+_COLOR_PUBLIC_SERVER = "\x1b[38;2;121;85;72m"
+_COLOR_RELOAD_STAMP = "\x1b[38;2;135;206;235m"
+_COLOR_GRAY = "\x1b[38;2;128;128;128m"
+_COLOR_USERNAME = _COLOR_GRAY
+_COLOR_DISCONNECTED = "\x1b[38;2;255;0;0m"
+_COLOR_DISCONNECT_STAMP = "\x1b[38;2;255;127;80m"
+_COLOR_BY_ICON = {
+    _ICON_OK: "\x1b[92m",
+    _ICON_WARN: "\x1b[93m",
+    _ICON_FAIL: "\x1b[91m",
+    _ICON_VIP: "\x1b[93m",
+    _ICON_VIP_SERVER: _COLOR_GRAY,
+    _ICON_PUBLIC_SERVER: _COLOR_GRAY,
+    _ICON_CHECKING: "\x1b[93m",
+    _ICON_TELEPORT: "\x1b[96m",
+}
+_COLOR_SUPPORT: Optional[bool] = None
+
+_KV_LINE_RE = re.compile(r"^\[[A-Z_]+\]\s+[a-z0-9_]+\b.*\b[a-zA-Z_][a-zA-Z0-9_]*=")
+
+
+def _enabled() -> bool:
+    value = os.environ.get("CRONUS_CONSOLE_ACTIVITY", "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def set_lua_liveness_required(enabled: bool) -> None:
+    global _LUA_LIVENESS_REQUIRED
+    with _LOCK:
+        _LUA_LIVENESS_REQUIRED = bool(enabled)
+
+
+def _enable_virtual_terminal() -> bool:
+    return console_output.enable_virtual_terminal(sys.stdout)
+
+
+def _colors_enabled() -> bool:
+    global _COLOR_SUPPORT
+    if not console_output.color_requested():
+        return False
+    if _COLOR_SUPPORT is None:
+        _COLOR_SUPPORT = _enable_virtual_terminal()
+    return bool(_COLOR_SUPPORT)
+
+
+def _paint(text: str, color: str = "") -> str:
+    return console_output.paint(text, color, enabled=_colors_enabled())
+
+
+def _text(value: Any, default: str = "") -> str:
+    if value is None:
+        return default
+    text = str(value).strip()
+    return text if text else default
+
+
+def _normalize_icon(value: Any, default: str = _ICON_OK) -> str:
+    icon = _text(value)
+    if not icon:
+        return default
+    return _ICON_ALIASES.get(icon.upper(), icon)
+
+
+def _int_text(value: Any, default: str = "") -> str:
+    try:
+        if value in (None, ""):
+            return default
+        return str(int(value))
+    except Exception:
+        return _text(value, default)
+
+
+def _boolish(value: Any, default: bool = False) -> bool:
+    text = _text(value).lower()
+    if text in {"1", "true", "yes", "on", "vip", "private", "private_server"}:
+        return True
+    if text in {"0", "false", "no", "off", "public"}:
+        return False
+    return default
+
+
+def _account(fields: Dict[str, Any]) -> str:
+    for key in ("account", "username", "account_id", "user"):
+        value = _text(fields.get(key))
+        if value:
+            return value
+    return "Account"
+
+
+def _account_key(account: Any) -> str:
+    return _text(account, "Account").lower()
+
+
+def _reason(fields: Dict[str, Any], default: str = "") -> str:
+    for key in ("reason", "trigger", "detail", "reject"):
+        value = _text(fields.get(key))
+        if value:
+            return value.strip().lower().replace(" ", "_")
+    return default
+
+
+def _reason_text(value: Any, default: str = "") -> str:
+    text = _text(value, default)
+    return text.strip().lower().replace(" ", "_") if text else default
+
+
+def _disconnect_reason(fields: Dict[str, Any], default: str = "") -> str:
+    detail = " ".join(
+        _text(fields.get(key)).lower()
+        for key in ("detail", "reason_msg", "message")
+        if _text(fields.get(key))
+    )
+    if "waiting for lua" in detail or "lua did not confirm" in detail:
+        return "lua_wait_timeout"
+    for key in ("display_reason", "actual_reason", "root_reason", "reason_key", "trigger", "watchdog_reason", "cooldown_reason", "reason"):
+        reason = _reason_text(fields.get(key))
+        if reason:
+            return reason
+    return _reason_text(default)
+
+
+def _pid(fields: Dict[str, Any]) -> str:
+    return _int_text(
+        fields.get("pid")
+        or fields.get("PID")
+        or fields.get("process_id")
+        or fields.get("roblox_pid")
+        or fields.get("matched_pid")
+        or fields.get("lua_pid")
+        or fields.get("bound_pid")
+    )
+
+
+def _pid_paren(value: Any, default: str = "unknown") -> str:
+    return _paint(f"(PID: {_text(value, default)})", _COLOR_GRAY)
+
+
+def _username_paren(value: Any, *, color: str = _COLOR_USERNAME) -> str:
+    return _paint(f"({_text(value, 'Account')})", color)
+
+
+def _server_kind(fields: Dict[str, Any]) -> str:
+    server_type = _text(fields.get("server_type") or fields.get("observed_server_type")).upper()
+    if _boolish(fields.get("is_vip") or fields.get("is_vip_server") or fields.get("private_server")):
+        return "VIP"
+    if server_type in {"VIP", "PRIVATE", "PRIVATE_SERVER"}:
+        return "VIP"
+    if server_type in {"PUBLIC", "PUBLIC_SERVER"}:
+        return "PUBLIC"
+    return ""
+
+
+def _server_paren(kind: str) -> str:
+    if kind == "VIP":
+        return _paint("(Private server)", _COLOR_GOLD)
+    if kind == "PUBLIC":
+        return _paint("(Public  server)", _COLOR_PUBLIC_SERVER)
+    return ""
+
+
+def _found_process_line(account: str, pid: Any, fields: Dict[str, Any] | None = None) -> Optional[str]:
+    account_text = _text(account, "Account")
+    pid_text = _text(pid, "unknown")
+    key = _account_key(account_text)
+    if pid_text:
+        _LAST_PID_BY_ACCOUNT[key] = pid_text
+    kind = _server_kind(fields or {}) or _SERVER_TYPE_BY_ACCOUNT.get(key, "")
+    dedupe_key = f"{key}:{pid_text}:{kind}"
+    now = time.monotonic()
+    previous = float(_LAST_FOUND_AT_BY_KEY.get(dedupe_key) or 0.0)
+    if previous and now - previous < _FOUND_DEDUP_SECONDS:
+        return None
+    _LAST_FOUND_AT_BY_KEY[dedupe_key] = now
+    suffix = f" In {_server_paren(kind)}" if kind else ""
+    return _line(
+        _ICON_OK,
+        f"{_paint('Found', _COLOR_WHITE)} {_username_paren(account_text)} {_pid_paren(pid_text)}{suffix}",
+        stamp_color=_COLOR_WHITE,
+    )
+
+
+def _reload_all_line(count: Any) -> str:
+    account_count = _int_text(count, "0")
+    return _line(_ICON_TELEPORT, f"Reload All Roblox ( {account_count} Accounts )", stamp_color=_COLOR_RELOAD_STAMP)
+
+
+def _teleport_line(account: str) -> Optional[str]:
+    key = _account_key(account)
+    now = time.monotonic()
+    previous = float(_LAST_TELEPORT_AT_BY_ACCOUNT.get(key) or 0.0)
+    if previous and now - previous < _TELEPORT_DEDUP_SECONDS:
+        return None
+    _LAST_TELEPORT_AT_BY_ACCOUNT[key] = now
+    return _line(_ICON_TELEPORT, f"{_username_paren(account)} Teleporting")
+
+
+def _duration_text(value: Any) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    try:
+        seconds = max(0.0, float(text))
+        if seconds == 0:
+            return "now"
+        if seconds.is_integer():
+            return f"{int(seconds)}s"
+        return f"{seconds:.1f}s"
+    except Exception:
+        return text
+
+
+def _suspect_process_line(account: str) -> str:
+    stamp = f"[{time.strftime('%H:%M:%S')}]"
+    if _colors_enabled():
+        stamp = _paint(stamp, _COLOR_GOLD)
+    return f"{stamp} {_ICON_CHECKING} {_username_paren(account)} Checking Roblox process"
+
+
+def _line(icon: str, message: str, *, indent: bool = False, stamp_color: str = _COLOR_DIM) -> str:
+    stamp = f"[{time.strftime('%H:%M:%S')}]"
+    icon_text = _normalize_icon(icon, default="")
+    gap = "   " if indent else " "
+    if _colors_enabled():
+        stamp = _paint(stamp, stamp_color)
+        icon_text = _paint(icon_text, _COLOR_BY_ICON.get(icon_text, "")) if icon_text else ""
+    if icon_text:
+        return f"{stamp}{gap}{icon_text} {message}"
+    return f"{stamp}{gap}{message}"
+
+
+def format_console_line(icon: str, message: str, *, indent: bool = False) -> str:
+    return _line(_normalize_icon(icon), _text(message), indent=indent)
+
+
+def _disconnect_line(account: str, reason: str = "") -> Optional[str]:
+    now = time.monotonic()
+    key = _text(account, "Account").lower()
+    previous = float(_LAST_DISCONNECT_AT.get(key) or 0.0)
+    if now - previous < _DISCONNECT_DEDUP_SECONDS:
+        return None
+    _LAST_DISCONNECT_AT[key] = now
+    suffix = f" ({reason})" if reason else ""
+    status = _paint(f"({_text(account, 'Account')}) disconnected", _COLOR_DISCONNECTED)
+    return _line(_ICON_WARN, f"{status}{suffix}", stamp_color=_COLOR_DISCONNECT_STAMP)
+
+
+def _captcha_line(account: str, pid: str = "") -> Optional[str]:
+    now = time.monotonic()
+    key = _text(account, "Account").lower()
+    previous = float(_LAST_CAPTCHA_AT.get(key) or 0.0)
+    if now - previous < _CAPTCHA_DEDUP_SECONDS:
+        return None
+    _LAST_CAPTCHA_AT[key] = now
+    pid_text = f" {_pid_paren(pid)}" if pid else ""
+    return _line(_ICON_VIP, f"{_username_paren(account)} CAPTCHA required{pid_text}")
+
+
+def _print_line(line: str) -> None:
+    console_output.write_line(line)
+
+
+def _emit_suspect_process_check(fields: Dict[str, Any]) -> None:
+    account = _account(fields)
+    key = account.lower()
+    final = _boolish(fields.get("final"), False)
+    finalized_at = float(_SUSPECT_FINALIZED_AT_BY_ACCOUNT.get(key) or 0.0)
+    if finalized_at and time.monotonic() - finalized_at <= _SUSPECT_FINAL_SUPPRESS_SECONDS:
+        return
+    if final:
+        _SUSPECT_LOGGED_ACCOUNTS.discard(key)
+        _SUSPECT_FINALIZED_AT_BY_ACCOUNT[key] = time.monotonic()
+        return
+    if key in _SUSPECT_LOGGED_ACCOUNTS:
+        return
+    _SUSPECT_FINALIZED_AT_BY_ACCOUNT.pop(key, None)
+    _SUSPECT_LOGGED_ACCOUNTS.add(key)
+    _print_line(_suspect_process_line(account))
+
+
+def _emit_check_before_disconnect(account: str) -> None:
+    key = _account_key(account)
+    if key in _SUSPECT_LOGGED_ACCOUNTS:
+        return
+    _SUSPECT_FINALIZED_AT_BY_ACCOUNT.pop(key, None)
+    _SUSPECT_LOGGED_ACCOUNTS.add(key)
+    _print_line(_suspect_process_line(account))
+
+
+def _title_text_locked() -> str:
+    return f"Accounts: {_TOTAL_ACCOUNTS} | Active: {len(_ACTIVE_ACCOUNTS)} | Queue: {_QUEUE_SIZE} | Captcha: {len(_CAPTCHA_ACCOUNTS)}"
+
+
+def _set_title_locked() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetConsoleTitleW(_title_text_locked())
+    except Exception:
+        pass
+
+
+def set_total_accounts(count: Any) -> None:
+    global _TOTAL_ACCOUNTS
+    try:
+        total = max(0, int(count or 0))
+    except Exception:
+        total = 0
+    with _LOCK:
+        _TOTAL_ACCOUNTS = total
+        _set_title_locked()
+
+
+def _update_counters(scope: str, name: str, fields: Dict[str, Any]) -> None:
+    global _QUEUE_SIZE
+    account = _account(fields)
+    if scope == "STATE" and name == "transition":
+        old = _text(fields.get("old")).upper()
+        new = _text(fields.get("new")).upper()
+        reason = _reason(fields)
+        if reason == "captcha_required":
+            _CAPTCHA_ACCOUNTS.add(account)
+        elif reason in {"manual_resume", "captcha_resume"} or new in {"QUEUED", "LAUNCHING", "VERIFY", "IN_GAME", "IDLE", "READY"}:
+            _CAPTCHA_ACCOUNTS.discard(account)
+        if new in {"LAUNCHING", "VERIFY"}:
+            _SERVER_TYPE_BY_ACCOUNT.pop(_account_key(account), None)
+        if new == "IN_GAME":
+            _ACTIVE_ACCOUNTS.add(account)
+        if old == "IN_GAME" and new != "IN_GAME":
+            _ACTIVE_ACCOUNTS.discard(account)
+        if new in {"FAILED", "IDLE"}:
+            _ACTIVE_ACCOUNTS.discard(account)
+        if new == "LAUNCHING":
+            _QUEUE_SIZE = max(0, _QUEUE_SIZE - 1)
+        if reason == "captcha_required":
+            _ACTIVE_ACCOUNTS.discard(account)
+    elif scope == "STATE" and name == "forced_reset":
+        _ACTIVE_ACCOUNTS.discard(account)
+        _CAPTCHA_ACCOUNTS.discard(account)
+    elif scope == "CAPTCHA" or name == "captcha_dialog_hold" or (scope == "RECOVERY" and name == "captcha_hold"):
+        if "resume" in name or "clear" in name or _reason(fields) in {"manual_resume", "captcha_resume"}:
+            _CAPTCHA_ACCOUNTS.discard(account)
+        else:
+            _CAPTCHA_ACCOUNTS.add(account)
+        _ACTIVE_ACCOUNTS.discard(account)
+    elif scope == "QUEUE":
+        if "size" in fields:
+            try:
+                _QUEUE_SIZE = max(0, int(fields.get("size") or 0))
+            except Exception:
+                pass
+        elif name == "cancel_all":
+            _QUEUE_SIZE = 0
+
+
+def _format_state(name: str, fields: Dict[str, Any]) -> Optional[str]:
+    account = _account(fields)
+    pid = _pid(fields)
+    if name == "transition":
+        new = _text(fields.get("new")).upper()
+        if _reason(fields) == "auto_close_cycle":
+            return None
+        if _reason(fields) == "captcha_required":
+            return _captcha_line(account, pid)
+        if new == "IN_GAME":
+            if pid:
+                _LAST_PID_BY_ACCOUNT[_account_key(account)] = pid
+            if _server_kind(fields) or _SERVER_TYPE_BY_ACCOUNT.get(_account_key(account)):
+                return _found_process_line(account, pid or "bound", fields)
+            return None
+        return None
+    if name == "process_bind_verified" and pid:
+        _LAST_PID_BY_ACCOUNT[_account_key(account)] = pid
+        if not _LUA_LIVENESS_REQUIRED:
+            return _found_process_line(account, pid, fields)
+        return None
+    return None
+
+
+def _format_recovery(name: str, fields: Dict[str, Any]) -> Optional[str]:
+    account = _account(fields)
+    reason = _reason(fields, "recovery")
+    if name == "captcha_hold" or reason == "captcha_required":
+        return _captcha_line(account, _pid(fields))
+    if name == "network_lost":
+        return _disconnect_line(account, _disconnect_reason(fields, "network_lost"))
+    if name == "cooldown":
+        display_reason = _disconnect_reason(fields, reason)
+        return _disconnect_line(account, display_reason)
+    return None
+
+
+def _format_misc(scope: str, name: str, fields: Dict[str, Any]) -> Optional[str]:
+    account = _account(fields)
+    pid = _pid(fields)
+    if scope == "RUNTIME" and name == "suspect_process_check":
+        return _suspect_process_line(account)
+    if scope in {"LUA", "LUA_EVENT"} and name == "teleport_detected":
+        return _teleport_line(account)
+    if scope == "QUEUE" and name == "auto_close_cycle":
+        return _reload_all_line(fields.get("killed"))
+    if scope == "CAPTCHA" or name == "captcha_dialog_hold" or (name == "account_hold" and _reason(fields) == "captcha_required"):
+        return _captcha_line(account, pid)
+    if scope == "WORKER" and name in {"visible_process_adopted", "rebind_refreshed"} and pid:
+        _LAST_PID_BY_ACCOUNT[_account_key(account)] = pid
+        if not _LUA_LIVENESS_REQUIRED:
+            return _found_process_line(account, pid, fields)
+        return None
+    if scope in {"SERVER", "VIP", "VIP_TRACKER"} and name in {"selected", "server_selected", "smart_selected", "private_server_selected"}:
+        return None
+    if scope in {"VIP", "VIP_DETECTOR"} and name in {"server_detected", "detected", "server_status"}:
+        kind = _server_kind(fields)
+        if kind:
+            _SERVER_TYPE_BY_ACCOUNT[_account_key(account)] = kind
+        last_pid = pid or _LAST_PID_BY_ACCOUNT.get(_account_key(account), "")
+        if kind and last_pid:
+            return _found_process_line(account, last_pid, fields)
+        return None
+    return None
+
+
+def _format_structured(scope: str, name: str, fields: Dict[str, Any]) -> Optional[str]:
+    if scope == "STATUS":
+        return None
+    if scope == "STATE":
+        return _format_state(name, fields)
+    if scope == "RECOVERY":
+        return _format_recovery(name, fields)
+    return _format_misc(scope, name, fields)
+
+
+def emit_structured(scope: str, name: str, **fields: Any) -> None:
+    if not _enabled():
+        return
+    scope_text = _text(scope).upper()
+    name_text = _text(name)
+    data = dict(fields)
+    with _LOCK:
+        _update_counters(scope_text, name_text, data)
+        if scope_text == "RUNTIME" and name_text == "suspect_process_check":
+            _emit_suspect_process_check(data)
+        else:
+            line = _format_structured(scope_text, name_text, data)
+            if line:
+                if " disconnected" in line:
+                    _emit_check_before_disconnect(_account(data))
+                _print_line(line)
+        _set_title_locked()
+
+
+def _format_text(message: str) -> Optional[str]:
+    msg = message.strip()
+    if not msg or _KV_LINE_RE.match(msg):
+        return None
+    if msg.startswith("[EVENT]") or msg.startswith("[RECOVERY] hold"):
+        return None
+
+    match = re.match(r"^\[WORKER\]\s+(.+?)\s+disconnect dialog detected - will recover in\s+([0-9.]+)s\b", msg)
+    if match:
+        return _disconnect_line(match.group(1).strip(), "disconnect_dialog")
+
+    match = re.match(r"^\[WORKER\]\s+(.+?)\s+Not Responding\b", msg)
+    if match:
+        return _disconnect_line(match.group(1).strip(), "not_responding")
+
+    match = re.match(r"^(?:\[(?:SERVER|VIP|VIP_TRACKER)\]\s+)?Smart server selected:\s*(.+)$", msg, re.IGNORECASE)
+    if match:
+        return None
+
+    return None
+
+
+def emit_text(message: str) -> None:
+    if not _enabled():
+        return
+    msg = str(message or "")
+    line = _format_text(msg)
+    if not line:
+        return
+    account = ""
+    match = re.match(r"^\[WORKER\]\s+(.+?)\s+(?:disconnect dialog detected|Not Responding)\b", msg.strip())
+    if match:
+        account = match.group(1).strip()
+    with _LOCK:
+        if account and " disconnected" in line:
+            _emit_check_before_disconnect(account)
+        _print_line(line)
+        _set_title_locked()
