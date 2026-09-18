@@ -147,6 +147,23 @@ if "--version" in sys.argv:
     print(f"{APP_NAME} {app_display_version()}")
     sys.exit(0)
 
+if __name__ == "__main__" and "--multi-roblox-guard" not in sys.argv:
+    # Earliest visible output. The imports below (and onefile extraction
+    # before them) otherwise leave the console blank for seconds, before
+    # the startup progress paints. ASCII-only: the exe console may not be
+    # UTF-8 (Run.cmd sets it, double-click does not).
+    try:
+        from version import app_display_version as _early_version_fn
+
+        _early_version = str(_early_version_fn() or "").strip()
+    except Exception:
+        _early_version = ""
+    _early_banner = f"{APP_NAME} {_early_version} - starting...".strip()
+    try:
+        print(_early_banner, flush=True)
+    except Exception:
+        pass
+
 if __name__ == "__main__":
     if not IS_COMPILED:
         _run_startup_dependency_checks()
@@ -174,6 +191,7 @@ from services.app_version_check import cleanup_legacy_update_stage
 from services.roblox_install_manager import RobloxInstallManager
 from services.executor_compatibility import ExecutorCompatibilityService
 from services.executor_relauncher import ExecutorRelaunchService
+from services.app_updater import AppUpdater
 
 from performance_settings import (
     apply_graphics_settings_file,
@@ -251,6 +269,7 @@ EXECUTOR_TRACKER = ExecutorCompatibilityService(
     logger=flog,
 )
 EXECUTOR_RELAUNCHER = ExecutorRelaunchService(cfg_mgr, farm, EXECUTOR_TRACKER, logger=flog_kv)
+APP_UPDATER = AppUpdater(farm, logger=flog_kv)
 farm.set_executor_start_guard(EXECUTOR_RELAUNCHER.ensure_started)
 cleanup_legacy_update_stage()
 
@@ -261,6 +280,7 @@ api_context = ApiContext(
     cfg_mgr=cfg_mgr,
     farm=farm,
     roblox_installer=ROBLOX_INSTALLER,
+    app_updater=APP_UPDATER,
     executor_tracker=EXECUTOR_TRACKER,
     executor_relauncher=EXECUTOR_RELAUNCHER,
     html_ui=get_html_ui,

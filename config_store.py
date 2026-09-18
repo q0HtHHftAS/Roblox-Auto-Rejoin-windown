@@ -9,7 +9,7 @@ from typing import Any, Dict, List
 
 from app_paths import APP_DATA_DIR
 from config_validation import CONFIG_SCHEMA_VERSION, validate_config_payload
-from domain.account_state import RuntimeState
+from domain.states import RuntimeState
 
 
 def _flog(message: str, level: str = "info") -> None:
@@ -156,6 +156,7 @@ DEFAULTS: Dict[str, Any] = {
     "multi_roblox_guard_self_heal_close_all": True,
     "rt_rotation_enabled": False,
     "runtime_account_allowlist": [],
+    "ui_col_widths": {},
     "accounts":                 [],
     "runtime_state":            {},
 }

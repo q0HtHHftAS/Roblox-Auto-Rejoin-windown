@@ -101,6 +101,22 @@ def register(app, ctx: ApiContext) -> None:
             return {"ok": False, "msg": f"Could not open browser: {exc}", **snap}
         return {"ok": True, "opened": True, "url": url, **snap}
 
+    @app.get("/api/update/status")
+    def api_update_status():
+        return ctx.app_updater.status()
+
+    @app.post("/api/update/apply")
+    async def api_update_apply(request: Request):
+        body = {}
+        try:
+            raw = await request.json()
+            if isinstance(raw, dict):
+                body = raw
+        except Exception:
+            body = {}
+        confirm = bool(body.get("confirm_stop_farm"))
+        return ctx.app_updater.start_update(confirm_stop_farm=confirm)
+
     @app.get("/api/troubleshoot/roblox-install")
     def api_roblox_install_status():
         return roblox_installer.status()
